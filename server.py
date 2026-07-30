@@ -1,12 +1,12 @@
 """
-Rendercode Quest — Backend Python (opcional)
-Para hosting propio. En Vercel/GitHub Pages funciona sin esto (usa localStorage).
+Rendercode Quest — Backend Python con soporte multi-usuario
+Opcional: en Vercel funciona sin esto (usa localStorage).
+Para hosting propio: Render, Railway, VPS.
 """
-from flask import Flask, send_from_directory, request, jsonify, session
-import sqlite3, json, os, secrets
+from flask import Flask, send_from_directory, request, jsonify
+import sqlite3, json, os, hashlib
 
 app = Flask(__name__, static_folder=".", static_url_path="")
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 DB = "quest.db"
 
 def get_db():
@@ -17,44 +17,68 @@ def get_db():
 def init_db():
     db = get_db()
     db.execute("""CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
+        username TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        display_name TEXT,
         data TEXT DEFAULT '{}',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
-    db.commit()
-    db.close()
+    db.commit(); db.close()
 
 init_db()
 
-def get_user_id():
-    if "uid" not in session:
-        session["uid"] = secrets.token_hex(16)
-    return session["uid"]
+def hash_pw(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
 
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
 
+@app.route("/api/register", methods=["POST"])
+def register():
+    d = request.json
+    username = d.get("username","").lower().strip()
+    password = d.get("password","")
+    if len(username) < 2: return jsonify({"error": "Usuario muy corto"}), 400
+    if len(password) < 4: return jsonify({"error": "Contraseña muy corta"}), 400
+    db = get_db()
+    if db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        db.close(); return jsonify({"error": "Usuario ya existe"}), 400
+    db.execute("INSERT INTO users (username, password_hash, display_name) VALUES (?,?,?)",
+               (username, hash_pw(password), d.get("displayName", username)))
+    db.commit(); db.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    d = request.json
+    username = d.get("username","").lower().strip()
+    db = get_db()
+    row = db.execute("SELECT password_hash, display_name FROM users WHERE username=?", (username,)).fetchone()
+    db.close()
+    if not row: return jsonify({"error": "Usuario no encontrado"}), 404
+    if row["password_hash"] != hash_pw(d.get("password","")): return jsonify({"error": "Contraseña incorrecta"}), 401
+    return jsonify({"ok": True, "displayName": row["display_name"]})
+
 @app.route("/api/load", methods=["GET"])
 def load():
-    uid = get_user_id()
+    user = request.args.get("user","").lower()
     db = get_db()
-    row = db.execute("SELECT data FROM users WHERE id=?", (uid,)).fetchone()
+    row = db.execute("SELECT data FROM users WHERE username=?", (user,)).fetchone()
     db.close()
-    if row:
+    if row and row["data"]:
         return jsonify(json.loads(row["data"]))
-    return jsonify({"checks": {}, "totalXp": 0, "streak": 0, "lastDay": None, "completedDays": 0})
+    return jsonify({"checks":{},"totalXp":0,"streak":0,"lastDay":None,"completedDays":0})
 
 @app.route("/api/save", methods=["POST"])
 def save():
-    uid = get_user_id()
-    data = json.dumps(request.json)
+    d = request.json
+    user = d.pop("user","").lower()
+    data = json.dumps(d)
     db = get_db()
-    db.execute("""INSERT INTO users (id, data) VALUES (?, ?)
-                  ON CONFLICT(id) DO UPDATE SET data=?, updated_at=CURRENT_TIMESTAMP""", (uid, data, data))
-    db.commit()
-    db.close()
+    db.execute("UPDATE users SET data=?, updated_at=CURRENT_TIMESTAMP WHERE username=?", (data, user))
+    db.commit(); db.close()
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
